@@ -4,6 +4,7 @@ mccli.py : CLI interface to MeschCore BLE companion app
 
 import asyncio
 import logging
+from typing import Optional
 
 
 # Make bleak optional - only fail if BLE operations are attempted
@@ -27,6 +28,11 @@ UART_RX_CHAR_UUID = "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"
 UART_TX_CHAR_UUID = "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"
 
 class BLEConnection:
+    # Upper bound on a single write (lock acquisition included). Healthy writes
+    # measured 0.06-0.17s against real hardware; observed stalls ran 20s to
+    # minutes, so this preempts them rather than waiting for CoreBluetooth.
+    WRITE_TIMEOUT = 10.0
+
     def __init__(self, address=None, device=None, client=None, pin=None):
         """
         Constructor: specify address or an existing BleakClient.
@@ -51,6 +57,52 @@ class BLEConnection:
         self.pin = pin
         self.rx_char = None
         self._disconnect_callback = None
+        self._background_tasks: set[asyncio.Task] = set()
+        self._write_lock_obj: Optional[asyncio.Lock] = None
+
+    @property
+    def _write_lock(self) -> asyncio.Lock:
+        """Serialises write_gatt_char().
+
+        Two overlapping writes to the same characteristic drop the link outright
+        (observed on macOS/CoreBluetooth: "BLE write failed: 19", connection
+        gone). Nothing above this layer guarantees callers are sequential --
+        schedulers, health checks and user commands all issue independently --
+        so the transport has to enforce it.
+
+        Lazily created so it binds to the running loop, mirroring the
+        _mesh_request_lock property in commands/base.py. Read through getattr so
+        an instance built without __init__ still works.
+        """
+        lock = getattr(self, "_write_lock_obj", None)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._write_lock_obj = lock
+        return lock
+
+    def _spawn_background(self, coro) -> asyncio.Task:
+        """Create a tracked background task (prevents GC of fire-and-forget tasks)."""
+        task = asyncio.create_task(coro)
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+        return task
+
+    async def _cleanup_stale_client(self):
+        """Best-effort disconnect of an existing self.client before it is replaced.
+
+        connect() always overwrites self.client with a fresh BleakClient on
+        reconnect. If the previous client's GATT notification subscription
+        (start_notify on UART_TX_CHAR_UUID) is never torn down, the stale
+        registration survives at the BlueZ D-Bus level and every future
+        notification fires twice: once for the stale registration, once for
+        the new one.
+        """
+        if self.client is not None:
+            try:
+                if self.client.is_connected:
+                    await self.client.disconnect()
+            except Exception:
+                logger.debug("Best-effort cleanup of stale BLE client failed", exc_info=True)
 
     async def connect(self):
         """
@@ -63,6 +115,8 @@ class BLEConnection:
             The address used for connection, or None on failure.
         """
         logger.debug(f"Connecting with client: {self.client}, address: {self.address}, device: {self.device}")
+
+        await self._cleanup_stale_client()
 
         if self.client:
             logger.debug("Using pre-configured BleakClient.")
@@ -116,9 +170,12 @@ class BLEConnection:
                     await self.client.pair()
                     logger.info("BLE pairing successful")
                 except Exception as e:
-                    logger.warning(f"BLE pairing failed: {e}")
-                    # Don't fail the connection if pairing fails, as the device
-                    # might already be paired or not require pairing
+                    logger.error(f"BLE pairing failed: {e}")
+                    # A failed pairing leaves the transport in a half-usable
+                    # state — re-raise so the caller gets a clean failure
+                    # instead of a silently degraded connection.
+                    await self.client.disconnect()
+                    raise
                     
         except BleakDeviceNotFoundError:
             return None
@@ -154,8 +211,19 @@ class BLEConnection:
         self.client = self._user_provided_client
         self.device = self._user_provided_device
 
+        # Re-register disconnect callback on the reset client so subsequent
+        # disconnects after a reconnect cycle are still detected.
+        if self.client is not None and hasattr(self.client, 'set_disconnected_callback'):
+            try:
+                self.client.set_disconnected_callback(self.handle_disconnect)
+            except Exception:
+                # set_disconnected_callback may not be available on all bleak
+                # versions; the next connect() call will re-create the client
+                # with the callback anyway.
+                pass
+
         if self._disconnect_callback:
-            asyncio.create_task(self._disconnect_callback("ble_disconnect"))
+            self._spawn_background(self._disconnect_callback("ble_disconnect"))
 
     def set_disconnect_callback(self, callback):
         """Set callback to handle disconnections."""
@@ -166,16 +234,44 @@ class BLEConnection:
 
     def handle_rx(self, _: BleakGATTCharacteristic, data: bytearray):
         if self.reader is not None:
-            asyncio.create_task(self.reader.handle_rx(data))
+            self._spawn_background(self.reader.handle_rx(data))
+
+    async def _write_locked(self, data):
+        async with self._write_lock:
+            await self.client.write_gatt_char(self.rx_char, bytes(data), response=True)
 
     async def send(self, data):
         if not self.client:
             logger.error("Client is not connected")
+            if self._disconnect_callback:
+                await self._disconnect_callback("ble_transport_lost")
             return False
         if not self.rx_char:
             logger.error("RX characteristic not found")
             return False
-        await self.client.write_gatt_char(self.rx_char, bytes(data), response=True)
+        # Bound the whole acquire-plus-write. A stalled write has been seen to
+        # hang for minutes, and CommandHandler's own timeout does not cover this
+        # -- it starts only after _sender_func returns -- so without a bound the
+        # serialising lock would queue every other command behind the stall
+        # indefinitely, with nothing logged and no disconnect raised. Turning one
+        # hung command into a silent whole-client stall would be worse than the
+        # overlap the lock exists to prevent.
+        try:
+            await asyncio.wait_for(self._write_locked(data), timeout=self.WRITE_TIMEOUT)
+        except asyncio.TimeoutError:
+            # Do not simply release and carry on: the underlying write may still
+            # be in flight, and a second write racing it re-creates the exact
+            # overlap that kills the link. Tear the connection down so the
+            # reconnect path takes over -- bounded and self-healing.
+            logger.warning(f"BLE write timed out after {self.WRITE_TIMEOUT}s")
+            if self._disconnect_callback:
+                await self._disconnect_callback("ble_write_timeout")
+            return False
+        except Exception as exc:
+            logger.warning(f"BLE write failed: {exc}")
+            if self._disconnect_callback:
+                await self._disconnect_callback(f"ble_write_failed: {exc}")
+            return False
 
     async def disconnect(self):
         """Disconnect from the BLE device."""

@@ -1,6 +1,6 @@
 import asyncio
 import logging
-from typing import Any, Callable, Coroutine, Dict, Optional, Union
+from typing import Any, Callable, Dict, Optional, Union
 
 from .events import Event, EventDispatcher, EventType, Subscription
 from .reader import MessageReader
@@ -28,10 +28,17 @@ class MeshCore:
         auto_reconnect: bool = False,
         max_reconnect_attempts: int = 3,
     ):
-        # Wrap connection with ConnectionManager
+        # Wrap connection with ConnectionManager.
+        # The reconnect callback ensures send_appstart() runs after every
+        # transport-level reconnect, which is required by firmware to
+        # initialize the session (F02).
         self.dispatcher = EventDispatcher()
         self.connection_manager = ConnectionManager(
-            cx, self.dispatcher, auto_reconnect, max_reconnect_attempts
+            cx,
+            self.dispatcher,
+            auto_reconnect,
+            max_reconnect_attempts,
+            reconnect_callback=self._on_reconnect,
         )
         self.cx = self.connection_manager  # For backward compatibility
 
@@ -39,13 +46,13 @@ class MeshCore:
         self.commands = CommandHandler(default_timeout=default_timeout)
         self.commands.set_contact_getter_by_prefix(self.get_contact_by_key_prefix)
 
-        # Set up logger
+        # Set up logger. Only override the level when the caller explicitly
+        # asked for debug/only_error behavior - otherwise leave whatever
+        # level the embedding app already configured alone.
         if debug:
             logger.setLevel(logging.DEBUG)
         elif only_error:
             logger.setLevel(logging.ERROR)
-        else:
-            logger.setLevel(logging.INFO)
 
         # Set up connections
         self.commands.set_connection(self.connection_manager)
@@ -111,9 +118,11 @@ class MeshCore:
         auto_reconnect: bool = False,
         max_reconnect_attempts: int = 3,
         cx_dly: float = 0.1,
+        rts = False,
+        dtr = True
     ) -> "MeshCore":
         """Create and connect a MeshCore instance using serial connection"""
-        connection = SerialConnection(port, baudrate, cx_dly=cx_dly)
+        connection = SerialConnection(port, baudrate, cx_dly=cx_dly, rts=rts, dtr=dtr)
 
         mc = cls(
             connection,
@@ -124,6 +133,19 @@ class MeshCore:
             max_reconnect_attempts=max_reconnect_attempts,
         )
         res = await mc.connect()
+        if res is None:
+            logger.info("No response from meshcore node, trying to invert dtr")
+            await mc.disconnect()
+            connection = SerialConnection(port, baudrate, cx_dly=cx_dly, rts=rts, dtr=not dtr)
+            mc = cls(
+                connection,
+                debug=debug,
+                only_error=only_error,
+                default_timeout=default_timeout,
+                auto_reconnect=auto_reconnect,
+                max_reconnect_attempts=max_reconnect_attempts,
+            )
+            res = await mc.connect()
         if res is None:
             logger.error("No response from meshcore node, disconnecting")
             logger.error("Are you sure your node is a serial companion ?")
@@ -174,13 +196,27 @@ class MeshCore:
             return None
         return mc
 
+    async def _on_reconnect(self):
+        """Callback invoked by ConnectionManager after a successful reconnect.
+
+        Firmware requires CMD_APP_START after every transport-level connection
+        to initialize the session.  MeshCore.connect() does this on the initial
+        connection; this callback ensures it also happens on reconnects (F02).
+        """
+        await self.commands.send_appstart(timeout=2)
+
     async def connect(self):
         await self.dispatcher.start()
-        result = await self.connection_manager.connect()
-        if result is None:
-            await self.dispatcher.stop()
-            raise ConnectionError("Failed to connect to device")
-        res = await self.commands.send_appstart()
+        try:
+            result = await self.connection_manager.connect()
+            if result is None:
+                raise ConnectionError("Failed to connect to device")
+            res = await self.commands.send_appstart(timeout=2)
+        except BaseException:
+            # The create_* factories drop this instance when connect() raises, so
+            # nothing else can stop the dispatcher task or close an opened transport.
+            await self.disconnect()
+            raise
         if res is None or res.type == EventType.ERROR:
             return None
         return res
@@ -206,7 +242,7 @@ class MeshCore:
     def subscribe(
         self,
         event_type: Union[EventType, None],
-        callback: Callable[[Event], Coroutine[Any, Any, None]],
+        callback: Callable[[Event], Union[None, asyncio.Future]],
         attribute_filters: Optional[Dict[str, Any]] = None,
     ) -> Subscription:
         """

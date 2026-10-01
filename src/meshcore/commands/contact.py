@@ -43,13 +43,17 @@ class ContactCommands(CommandHandlerBase):
                     logger.debug("Timeout while getting contacts")
                     for future in pending: # cancel all futures
                         future.cancel()
-                    return None
+                    return Event(EventType.ERROR, {"reason": "timeout waiting for contacts"})
 
                 for future in done:
                     event = await future
-                    if event is None or event.type != EventType.NEXT_CONTACT:
-                        for future in pending:
-                            future.cancel()
+                    if event is None:
+                        for f in pending:
+                            f.cancel()
+                        return Event(EventType.ERROR, {"reason": "no event received during contacts retrieval"})
+                    if event.type != EventType.NEXT_CONTACT:
+                        for f in pending:
+                            f.cancel()
                         return event
 
                 futures = []
@@ -64,7 +68,7 @@ class ContactCommands(CommandHandlerBase):
     
         except asyncio.TimeoutError:
             logger.debug(f"Timeout receiving contacts")
-            return None
+            return Event(EventType.ERROR, {"reason": "asyncio timeout receiving contacts"})
         except Exception as e:
             logger.debug(f"Command error: {e}")
             return Event(EventType.ERROR, {"error": str(e)})
@@ -116,7 +120,9 @@ class ContactCommands(CommandHandlerBase):
                     path_hash_mode = int(path.split(":")[1])
                     path = path.split(":")[0].replace(":","")
                 else: # use device one by default
-                    path_hash_mode = contact["out_path_len"] >> 6 # would fallback to previous val
+                    # out_path_len is pre-masked (& 0x3F) in reader.py, so high bits are always 0;
+                    # the actual path_hash_mode is fetched from the device query below.
+                    path_hash_mode = 0
                     res = await self.send_device_query()
                     if not res is None and res.type != EventType.ERROR:
                         if "path_hash_mode" in res.payload:
@@ -184,6 +190,24 @@ class ContactCommands(CommandHandlerBase):
     async def get_autoadd_config(self) -> Event:
         data = b"\x3B"
         return await self.send(data, [EventType.AUTOADD_CONFIG, EventType.ERROR])
+
+    async def get_contact_by_key(self, pubkey: bytes) -> Event:
+        """N09: Retrieve a single contact by its public key (CMD 30).
+
+        Args:
+            pubkey: 32-byte public key of the contact.
+
+        Returns:
+            Event with the contact data (same format as CONTACT/NEXT_CONTACT),
+            or ERROR if not found.
+        """
+        if not isinstance(pubkey, (bytes, bytearray)):
+            raise TypeError("pubkey must be bytes-like")
+        # Truncate or pad to 32 bytes
+        key_bytes = bytes(pubkey[:32])
+        logger.debug(f"Getting contact by key: {key_bytes.hex()}")
+        data = b"\x1e" + key_bytes
+        return await self.send(data, [EventType.NEXT_CONTACT, EventType.ERROR])
 
     async def get_advert_path(self, key: DestinationType) -> Event:
         key_bytes = _validate_destination(key, prefix_length=32)

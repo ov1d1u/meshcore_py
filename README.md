@@ -1,6 +1,6 @@
 # Python MeshCore
 
-Python library for interacting with [MeshCore](https://meshcore.co.uk) companion radio nodes.
+Python library for interacting with [MeshCore](https://meshcore.io) companion radio nodes.
 
 ## Installation
 
@@ -371,6 +371,15 @@ meshcore = await MeshCore.create_serial("/dev/ttyUSB0", debug=True)
 
 This logs detailed information about commands sent and events received.
 
+meshcore_py does not configure Python's root logger or call `logging.basicConfig()` itself - it only attaches a `NullHandler` so it stays silent by default. To see its logs, configure logging in your own application, e.g.:
+
+```python
+import logging
+
+logging.basicConfig(level=logging.INFO)
+logging.getLogger("meshcore").setLevel(logging.DEBUG)
+```
+
 ## Common Examples
 
 ### Sending Messages to Contacts
@@ -518,6 +527,8 @@ All commands are async methods that return `Event` objects. Commands are organiz
 | **Device Actions** ||||
 | `send_advert(flood=False)` | `flood: bool` | `OK` | Send advertisement (optionally flood network) |
 | `reboot()` | None | None | Reboot device (no response expected) |
+| `run_cli_command()` | `cmd: str` | `CLI_REPLY/ERROR` | Send a cli command to device |
+| `send_raw_packet()` | `data: str/bytes, priority=0` | `OK/ERROR` | Send a raw packet through device, can be an hex string or bytes |
 | **Security** ||||
 | `export_private_key()` | None | `PRIVATE_KEY/DISABLED` | Export device private key (requires PIN auth & enabled firmware) |
 | `import_private_key(key)` | `key: bytes` | `OK` | Import private key to device |
@@ -527,6 +538,8 @@ All commands are async methods that return `Event` objects. Commands are organiz
 | `get_stats_packets()` | None | `STATS_PACKETS` | Get packet statistics (rx/tx totals, flood vs. direct, recv_errors when present) |
 | **Advanced Configuration** ||||
 | `set_multi_acks(multi_acks)` | `multi_acks: int` | `OK` | Set multi-acks mode (experimental ack repeats) |
+| `set_path_hash_mode(mode)` | `mode: int` | `OK` | Set the device's path hash mode: how many bytes of each hop's node ID are stored per hop in advertised/logged paths (bytes per hop = `mode + 1`, e.g. mode 0 = 1 byte/hop, mode 1 = 2 bytes/hop) |
+| `get_path_hash_mode()` | None | `int` | Get the device's current path hash mode |
 
 #### Contact Commands (`meshcore.commands.*`)
 

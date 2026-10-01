@@ -11,7 +11,7 @@ logger = logging.getLogger("meshcore")
 
 
 class SerialConnection:
-    def __init__(self, port, baudrate, cx_dly=0.2):
+    def __init__(self, port, baudrate, cx_dly=0.2, rts=False, dtr=True):
         self.port = port
         self.baudrate = baudrate
         self.transport = None
@@ -20,10 +20,20 @@ class SerialConnection:
         self._disconnect_callback = None
         self.cx_dly = cx_dly
         self._connected_event = asyncio.Event()
+        self._background_tasks: set[asyncio.Task] = set()
+        self.rts = rts
+        self.dtr = dtr
 
         self.frame_expected_size = 0
         self.inframe = b""
         self.header = b""
+
+    def _spawn_background(self, coro) -> asyncio.Task:
+        """Create a tracked background task (prevents GC of fire-and-forget tasks)."""
+        task = asyncio.create_task(coro)
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+        return task
 
     class MCSerialClientProtocol(asyncio.Protocol):
         def __init__(self, cx):
@@ -33,7 +43,8 @@ class SerialConnection:
             self.cx.transport = transport
             logger.debug('port opened')
             if isinstance(transport, serial_asyncio.SerialTransport) and transport.serial:
-                transport.serial.rts = False  # You can manipulate Serial object via transport
+                transport.serial.dtr = self.cx.dtr  # DTR should be deasserted on heltec_v2 to avoid serial-open reset/handshake issues
+                transport.serial.rts = self.cx.rts
             self.cx._connected_event.set()
 
         def data_received(self, data):
@@ -44,7 +55,7 @@ class SerialConnection:
             self.cx._connected_event.clear()
 
             if self.cx._disconnect_callback:
-                asyncio.create_task(self.cx._disconnect_callback("serial_disconnect"))
+                self.cx._spawn_background(self.cx._disconnect_callback("serial_disconnect"))
 
         def pause_writing(self):
             logger.debug("pause writing")
@@ -52,21 +63,35 @@ class SerialConnection:
         def resume_writing(self):
             logger.debug("resume writing")
 
-    async def connect(self):
+    async def connect(self, timeout: float = 10.0):
         """
-        Connects to the device
+        Connects to the device.
+
+        Args:
+            timeout: Maximum seconds to wait for connection_made callback.
+                     Defaults to 10.0. Raises asyncio.TimeoutError on expiry.
         """
         self._connected_event.clear()
-        
+
         loop = asyncio.get_running_loop()
-        await serial_asyncio.create_serial_connection(
+        transport, _ = await serial_asyncio.create_serial_connection(
             loop,
             lambda: self.MCSerialClientProtocol(self),
             self.port,
             baudrate=self.baudrate,
         )
 
-        await self._connected_event.wait()
+        try:
+            await asyncio.wait_for(self._connected_event.wait(), timeout=timeout)
+        except Exception:
+            # create_serial_connection() already opened the port's fds;
+            # connection_made() never fired (or didn't in time) to hand them
+            # to self.transport, so close directly on the local reference or
+            # they leak until the process runs out of fds (#95).
+            if self.transport is transport:
+                self.transport = None
+            transport.close()
+            raise
         logger.info("Serial Connection started")
         return self.port
 
@@ -102,7 +127,7 @@ class SerialConnection:
                 self.frame_expected_size = 0
                 if len(data) > 0: # rerun handle_rx on remaining data
                     self.handle_rx(data)
-                    return
+                return  # nothing left to process after reset
 
         upbound = self.frame_expected_size - len(self.inframe)
         if len(data) < upbound:
@@ -114,7 +139,7 @@ class SerialConnection:
         data = data[upbound:]
         if self.reader is not None:
             # feed meshcore reader
-            asyncio.create_task(self.reader.handle_rx(self.inframe))
+            self._spawn_background(self.reader.handle_rx(self.inframe))
         # reset inframe
         self.inframe = b""
         self.header = b""
@@ -125,11 +150,18 @@ class SerialConnection:
     async def send(self, data):
         if not self.transport:
             logger.error("Transport not connected, cannot send data")
+            if self._disconnect_callback:
+                await self._disconnect_callback("serial_transport_lost")
             return
         size = len(data)
         pkt = b"\x3c" + size.to_bytes(2, byteorder="little") + data
         logger.debug(f"sending pkt : {pkt}")
-        self.transport.write(pkt)
+        try:
+            self.transport.write(pkt)
+        except OSError as exc:
+            logger.warning(f"Serial write failed: {exc}")
+            if self._disconnect_callback:
+                await self._disconnect_callback(f"serial_write_failed: {exc}")
 
     async def disconnect(self):
         """Close the serial connection."""
